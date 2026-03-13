@@ -485,9 +485,14 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   let autoresearchMode = false;
   let lastCtx: ExtensionContext | null = null;
 
+  const MAX_AUTORESUME_TURNS = 20;
+  const BENCHMARK_GUARDRAIL =
+    "Be careful not to overfit to the benchmarks and do not cheat on the benchmarks.";
+
   // Auto-resume tracking
   let lastAutoResumeTime = 0;
   let experimentsThisSession = 0; // reset on agent_start, incremented on log_experiment
+  let autoResumeTurns = 0;
 
   // Track last run's checks result so log_experiment can gate "keep" status
   let lastRunChecks: { pass: boolean; output: string; duration: number } | null = null;
@@ -509,6 +514,19 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     name: null,
     currentSegment: 0,
   };
+
+  const autoresearchHelp = () =>
+    [
+      "Usage: /autoresearch [off|clear|<text>]",
+      "",
+      "<text> enters autoresearch mode and starts or resumes the loop.",
+      "off leaves autoresearch mode.",
+      "clear deletes autoresearch.jsonl and leaves autoresearch mode.",
+      "",
+      "Examples:",
+      "  /autoresearch optimize unit test runtime, monitor correctness",
+      "  /autoresearch model training, run 5 minutes of train.py and note the loss ratio as optimization target",
+    ].join("\n");
 
   // -----------------------------------------------------------------------
   // State reconstruction
@@ -608,10 +626,8 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       }
     }
 
-    // Also detect autoresearch mode from file presence
-    if (fs.existsSync(path.join(ctx.cwd, "autoresearch.md"))) {
-      autoresearchMode = true;
-    }
+    // Auto-enter autoresearch mode only when a persisted experiment log exists
+    autoresearchMode = fs.existsSync(path.join(ctx.cwd, "autoresearch.jsonl"));
 
     updateWidget(ctx);
   };
@@ -756,6 +772,14 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     if (now - lastAutoResumeTime < 5 * 60 * 1000) return;
     lastAutoResumeTime = now;
 
+    if (autoResumeTurns >= MAX_AUTORESUME_TURNS) {
+      ctx.ui.notify(
+        `Autoresearch auto-resume limit reached (${MAX_AUTORESUME_TURNS} turns)`,
+        "info"
+      );
+      return;
+    }
+
     // Auto-continue: send a message to resume the loop
     // The agent reads autoresearch.md on startup which has all context
     const ideasPath = path.join(ctx.cwd, "autoresearch.ideas.md");
@@ -765,7 +789,9 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     if (hasIdeas) {
       resumeMsg += " Check autoresearch.ideas.md for promising paths to explore. Prune stale/tried ideas.";
     }
+    resumeMsg += ` ${BENCHMARK_GUARDRAIL}`;
 
+    autoResumeTurns++;
     pi.sendUserMessage(resumeMsg);
   });
 
@@ -787,6 +813,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       "\nUse init_experiment, run_experiment, and log_experiment tools. NEVER STOP until interrupted." +
       `\nExperiment rules: ${mdPath} — read this file at the start of every session and after compaction.` +
       "\nWrite promising but deferred optimizations as bullet points to autoresearch.ideas.md — don't let good ideas get lost." +
+      `\n${BENCHMARK_GUARDRAIL}` +
       "\nIf the user sends a follow-on message while an experiment is running, finish the current run_experiment + log_experiment cycle first, then address their message in the next iteration.";
 
     if (hasChecks) {
@@ -1539,35 +1566,63 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   // -----------------------------------------------------------------------
 
   pi.registerCommand("autoresearch", {
-    description: "Toggle autoresearch mode on/off, or start a new experiment",
+    description: "Start, stop, clear, or resume autoresearch mode",
     handler: async (args, ctx) => {
-      if (args === "off") {
+      const trimmedArgs = (args ?? "").trim();
+      const command = trimmedArgs.toLowerCase();
+
+      if (!trimmedArgs) {
+        ctx.ui.notify(autoresearchHelp(), "info");
+        return;
+      }
+
+      if (command === "off") {
         autoresearchMode = false;
+        autoResumeTurns = 0;
+        experimentsThisSession = 0;
         ctx.ui.notify("Autoresearch mode OFF", "info");
         return;
       }
 
+      if (command === "clear") {
+        const jsonlPath = path.join(ctx.cwd, "autoresearch.jsonl");
+        autoresearchMode = false;
+        autoResumeTurns = 0;
+        experimentsThisSession = 0;
+        state = {
+          results: [],
+          bestMetric: null,
+          bestDirection: "lower",
+          metricName: "metric",
+          metricUnit: "",
+          secondaryMetrics: [],
+          name: null,
+          currentSegment: 0,
+        };
+        updateWidget(ctx);
+
+        if (fs.existsSync(jsonlPath)) {
+          fs.unlinkSync(jsonlPath);
+          ctx.ui.notify("Deleted autoresearch.jsonl and turned autoresearch mode OFF", "info");
+        } else {
+          ctx.ui.notify("No autoresearch.jsonl found. Autoresearch mode OFF", "info");
+        }
+        return;
+      }
+
       autoresearchMode = true;
+      autoResumeTurns = 0;
 
       const mdPath = path.join(ctx.cwd, "autoresearch.md");
       const hasRules = fs.existsSync(mdPath);
 
       if (hasRules) {
         ctx.ui.notify("Autoresearch mode ON — rules loaded from autoresearch.md", "info");
-        if (args) {
-          // User gave specific instructions, pass them along
-          pi.sendUserMessage(`Autoresearch mode active. ${args}`);
-        } else {
-          pi.sendUserMessage(
-            "Autoresearch mode active. Read autoresearch.md and autoresearch.sh, then resume the experiment loop."
-          );
-        }
+        pi.sendUserMessage(`Autoresearch mode active. ${trimmedArgs} ${BENCHMARK_GUARDRAIL}`);
       } else {
         ctx.ui.notify("Autoresearch mode ON — no autoresearch.md found, setting up", "info");
         pi.sendUserMessage(
-          args
-            ? `Start autoresearch: ${args}`
-            : "Start autoresearch. No autoresearch.md found — gather context and set up the experiment (create autoresearch.md and autoresearch.sh)."
+          `Start autoresearch: ${trimmedArgs} ${BENCHMARK_GUARDRAIL}`
         );
       }
     },
