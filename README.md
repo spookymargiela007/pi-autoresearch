@@ -40,6 +40,7 @@ Inspired by [karpathy/autoresearch](https://github.com/karpathy/autoresearch). W
 |------|---------|
 | `autoresearch.md` | Session document — objective, metrics, files in scope, what's been tried. A fresh agent can resume from this alone. |
 | `autoresearch.sh` | Benchmark script — pre-checks, runs the workload, outputs `METRIC name=number` lines. |
+| `autoresearch.checks.sh` | *(optional)* Backpressure checks — tests, types, lint. Runs after each passing benchmark. Failures block `keep`. |
 
 ---
 
@@ -127,6 +128,28 @@ autoresearch.md      — living document: objective, what's been tried, dead end
 ```
 
 A fresh agent with no memory can read these two files and continue exactly where the previous session left off.
+
+---
+
+## Backpressure checks (optional)
+
+Create `autoresearch.checks.sh` to run correctness checks (tests, types, lint) after every passing benchmark. This ensures optimizations don't break things.
+
+```bash
+#!/bin/bash
+set -euo pipefail
+pnpm test --run
+pnpm typecheck
+```
+
+**How it works:**
+
+- If the file doesn't exist, everything behaves exactly as before — no changes to the loop.
+- If it exists, it runs automatically after every benchmark that exits 0.
+- Checks execution time does **not** affect the primary metric.
+- If checks fail, the experiment is logged as `checks_failed` (same behavior as a crash — no commit, revert changes).
+- The `checks_failed` status is shown separately in the dashboard so you can distinguish correctness failures from benchmark crashes.
+- Checks have a separate timeout (default 300s, configurable via `checks_timeout_seconds` in `run_experiment`).
 
 ---
 

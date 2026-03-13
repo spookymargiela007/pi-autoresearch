@@ -11,7 +11,7 @@ Autonomous experiment loop: try ideas, keep what works, discard what doesn't, ne
 
 - **`init_experiment`** — configure session (name, metric, unit, direction). Call again to re-initialize with a new baseline when the optimization target changes.
 - **`run_experiment`** — runs command, times it, captures output.
-- **`log_experiment`** — records result. `keep` auto-commits. `discard`/`crash` → `git checkout -- .` to revert. Always include secondary `metrics` dict. Dashboard: ctrl+x.
+- **`log_experiment`** — records result. `keep` auto-commits. `discard`/`crash`/`checks_failed` → `git checkout -- .` to revert. Always include secondary `metrics` dict. Dashboard: ctrl+x.
 
 ## Setup
 
@@ -57,6 +57,29 @@ Update `autoresearch.md` periodically — especially the "What's Been Tried" sec
 ### `autoresearch.sh`
 
 Bash script (`set -euo pipefail`) that: pre-checks fast (syntax errors in <1s), runs the benchmark, outputs `METRIC name=number` lines. Keep it fast — every second is multiplied by hundreds of runs. Update it during the loop as needed.
+
+### `autoresearch.checks.sh` (optional)
+
+Bash script (`set -euo pipefail`) for backpressure/correctness checks: tests, types, lint, etc. **Only create this file when the user's constraints require correctness validation** (e.g., "tests must pass", "types must check").
+
+When this file exists:
+- Runs automatically after every **passing** benchmark in `run_experiment`.
+- If checks fail, `run_experiment` reports it clearly — log as `checks_failed`.
+- Its execution time does **NOT** affect the primary metric.
+- You cannot `keep` a result when checks have failed.
+- Has a separate timeout (default 300s, configurable via `checks_timeout_seconds`).
+
+When this file does **not** exist, everything behaves exactly as before — no changes to the loop.
+
+**Keep output minimal.** Only the last 80 lines of checks output are fed back to the agent on failure. Suppress verbose progress/success output and let only errors through. This keeps context lean and helps the agent pinpoint what broke.
+
+```bash
+#!/bin/bash
+set -euo pipefail
+# Example: run tests and typecheck — suppress success output, only show errors
+pnpm test --run --reporter=dot 2>&1 | tail -50
+pnpm typecheck 2>&1 | grep -i error || true
+```
 
 ## Loop Rules
 

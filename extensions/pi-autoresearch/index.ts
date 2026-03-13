@@ -33,7 +33,7 @@ interface ExperimentResult {
   metric: number;
   /** Additional tracked metrics: { name: value } */
   metrics: Record<string, number>;
-  status: "keep" | "discard" | "crash";
+  status: "keep" | "discard" | "crash" | "checks_failed";
   description: string;
   timestamp: number;
   /** Segment index — increments on each config header. Current segment = highest. */
@@ -67,6 +67,11 @@ interface RunDetails {
   crashed: boolean;
   timedOut: boolean;
   tailOutput: string;
+  /** null = checks not run (no file or benchmark failed), true/false = ran */
+  checksPass: boolean | null;
+  checksTimedOut: boolean;
+  checksOutput: string;
+  checksDuration: number;
 }
 
 interface LogDetails {
@@ -86,6 +91,12 @@ const RunParams = Type.Object({
   timeout_seconds: Type.Optional(
     Type.Number({
       description: "Kill after this many seconds (default: 600)",
+    })
+  ),
+  checks_timeout_seconds: Type.Optional(
+    Type.Number({
+      description:
+        "Kill autoresearch.checks.sh after this many seconds (default: 300). Only relevant when the checks file exists.",
     })
   ),
 });
@@ -119,7 +130,7 @@ const LogParams = Type.Object({
     description:
       "The primary optimization metric value (e.g. seconds, val_bpb). 0 for crashes.",
   }),
-  status: StringEnum(["keep", "discard", "crash"] as const),
+  status: StringEnum(["keep", "discard", "crash", "checks_failed"] as const),
   description: Type.String({
     description: "Short description of what this experiment tried",
   }),
@@ -247,6 +258,7 @@ function renderDashboardLines(
   const kept = cur.filter((r) => r.status === "keep").length;
   const discarded = cur.filter((r) => r.status === "discard").length;
   const crashed = cur.filter((r) => r.status === "crash").length;
+  const checksFailed = cur.filter((r) => r.status === "checks_failed").length;
 
   const baseline = st.bestMetric;
   const baselineSec = findBaselineSecondary(st.results, st.currentSegment, st.secondaryMetrics);
@@ -273,7 +285,8 @@ function renderDashboardLines(
       `  ${th.fg("muted", "Runs:")} ${th.fg("text", String(st.results.length))}` +
         `  ${th.fg("success", `${kept} kept`)}` +
         (discarded > 0 ? `  ${th.fg("warning", `${discarded} discarded`)}` : "") +
-        (crashed > 0 ? `  ${th.fg("error", `${crashed} crashed`)}` : ""),
+        (crashed > 0 ? `  ${th.fg("error", `${crashed} crashed`)}` : "") +
+        (checksFailed > 0 ? `  ${th.fg("error", `${checksFailed} checks failed`)}` : ""),
       width
     )
   );
@@ -341,7 +354,7 @@ function renderDashboardLines(
   );
 
   // Column definitions
-  const col = { idx: 3, commit: 8, primary: 11, status: 8 };
+  const col = { idx: 3, commit: 8, primary: 11, status: 15 };
   const secColWidth = 11;
   const totalSecWidth = secMetrics.length * secColWidth;
   const descW = Math.max(
@@ -401,7 +414,7 @@ function renderDashboardLines(
       ? "dim"
       : r.status === "keep"
         ? "success"
-        : r.status === "crash"
+        : r.status === "crash" || r.status === "checks_failed"
           ? "error"
           : "warning";
 
@@ -476,6 +489,9 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   let lastAutoResumeTime = 0;
   let experimentsThisSession = 0; // reset on agent_start, incremented on log_experiment
 
+  // Track last run's checks result so log_experiment can gate "keep" status
+  let lastRunChecks: { pass: boolean; output: string; duration: number } | null = null;
+
   // Running experiment state (for spinner in fullscreen overlay)
   let runningExperiment: { startedAt: number; command: string } | null = null;
   let overlayTui: { requestRender: () => void } | null = null;
@@ -499,6 +515,10 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   // -----------------------------------------------------------------------
 
   const reconstructState = (ctx: ExtensionContext) => {
+    // Reset transient run state on session boundaries
+    lastRunChecks = null;
+    runningExperiment = null;
+
     state = {
       results: [],
       bestMetric: null,
@@ -641,6 +661,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         const cur = currentResults(state.results, state.currentSegment);
         const kept = cur.filter((r) => r.status === "keep").length;
         const crashed = cur.filter((r) => r.status === "crash").length;
+        const checksFailed = cur.filter((r) => r.status === "checks_failed").length;
         const baseline = state.bestMetric;
         const baselineSec = findBaselineSecondary(state.results, state.currentSegment, state.secondaryMetrics);
 
@@ -666,6 +687,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
           theme.fg("muted", ` ${state.results.length} runs`),
           theme.fg("success", ` ${kept} kept`),
           crashed > 0 ? theme.fg("error", ` ${crashed}💥`) : "",
+          checksFailed > 0 ? theme.fg("error", ` ${checksFailed}⚠`) : "",
           theme.fg("dim", " │ "),
           theme.fg("warning", theme.bold(`★ ${state.metricName}: ${formatNum(displayVal, state.metricUnit)}`)),
           bestRunNum > 0 ? theme.fg("dim", ` #${bestRunNum}`) : "",
@@ -756,6 +778,9 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     const ideasPath = path.join(ctx.cwd, "autoresearch.ideas.md");
     const hasIdeas = fs.existsSync(ideasPath);
 
+    const checksPath = path.join(ctx.cwd, "autoresearch.checks.sh");
+    const hasChecks = fs.existsSync(checksPath);
+
     let extra =
       "\n\n## Autoresearch Mode (ACTIVE)" +
       "\nYou are in autoresearch mode. Optimize the primary metric through an autonomous experiment loop." +
@@ -763,6 +788,16 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       `\nExperiment rules: ${mdPath} — read this file at the start of every session and after compaction.` +
       "\nWrite promising but deferred optimizations as bullet points to autoresearch.ideas.md — don't let good ideas get lost." +
       "\nIf the user sends a follow-on message while an experiment is running, finish the current run_experiment + log_experiment cycle first, then address their message in the next iteration.";
+
+    if (hasChecks) {
+      extra +=
+        "\n\n## Backpressure Checks (ACTIVE)" +
+        `\n${checksPath} exists and runs automatically after every passing benchmark in run_experiment.` +
+        "\nIf the benchmark passes but checks fail, run_experiment will report it clearly." +
+        "\nUse status 'checks_failed' in log_experiment when this happens — it behaves like a crash (no commit, revert changes)." +
+        "\nYou cannot use status 'keep' when checks have failed." +
+        "\nThe checks execution time does NOT affect the primary metric.";
+    }
 
     if (hasIdeas) {
       extra += `\n\n💡 Ideas backlog exists at ${ideasPath} — check it for promising experiment paths. Prune stale entries.`;
@@ -900,7 +935,40 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
       const durationSeconds = (Date.now() - t0) / 1000;
       const output = (result.stdout + "\n" + result.stderr).trim();
-      const passed = result.code === 0 && !result.killed;
+      const benchmarkPassed = result.code === 0 && !result.killed;
+
+      // Run backpressure checks if benchmark passed and checks file exists
+      let checksPass: boolean | null = null;
+      let checksTimedOut = false;
+      let checksOutput = "";
+      let checksDuration = 0;
+
+      const checksPath = path.join(ctx.cwd, "autoresearch.checks.sh");
+      if (benchmarkPassed && fs.existsSync(checksPath)) {
+        const checksTimeout = (params.checks_timeout_seconds ?? 300) * 1000;
+        const ct0 = Date.now();
+        try {
+          const checksResult = await pi.exec("bash", [checksPath], {
+            signal,
+            timeout: checksTimeout,
+            cwd: ctx.cwd,
+          });
+          checksDuration = (Date.now() - ct0) / 1000;
+          checksTimedOut = !!checksResult.killed;
+          checksPass = checksResult.code === 0 && !checksResult.killed;
+          checksOutput = (checksResult.stdout + "\n" + checksResult.stderr).trim();
+        } catch (e) {
+          checksDuration = (Date.now() - ct0) / 1000;
+          checksPass = false;
+          checksOutput = e instanceof Error ? e.message : String(e);
+        }
+      }
+
+      // Store checks result for log_experiment gate
+      lastRunChecks = checksPass !== null ? { pass: checksPass, output: checksOutput, duration: checksDuration } : null;
+
+      // Overall pass: benchmark must pass AND checks must pass (if they ran)
+      const passed = benchmarkPassed && (checksPass === null || checksPass);
 
       const details: RunDetails = {
         command: params.command,
@@ -910,16 +978,31 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         crashed: !passed,
         timedOut: !!result.killed,
         tailOutput: output.split("\n").slice(-80).join("\n"),
+        checksPass,
+        checksTimedOut,
+        checksOutput: checksOutput.split("\n").slice(-80).join("\n"),
+        checksDuration,
       };
 
       // Build LLM response
       let text = "";
       if (details.timedOut) {
         text += `⏰ TIMEOUT after ${durationSeconds.toFixed(1)}s\n`;
-      } else if (!passed) {
+      } else if (!benchmarkPassed) {
         text += `💥 FAILED (exit code ${result.code}) in ${durationSeconds.toFixed(1)}s\n`;
+      } else if (checksTimedOut) {
+        text += `✅ Benchmark PASSED in ${durationSeconds.toFixed(1)}s\n`;
+        text += `⏰ CHECKS TIMEOUT (autoresearch.checks.sh) after ${checksDuration.toFixed(1)}s\n`;
+        text += `Log this as 'checks_failed' — the benchmark metric is valid but checks timed out.\n`;
+      } else if (checksPass === false) {
+        text += `✅ Benchmark PASSED in ${durationSeconds.toFixed(1)}s\n`;
+        text += `💥 CHECKS FAILED (autoresearch.checks.sh) in ${checksDuration.toFixed(1)}s\n`;
+        text += `Log this as 'checks_failed' — the benchmark metric is valid but correctness checks did not pass.\n`;
       } else {
         text += `✅ PASSED in ${durationSeconds.toFixed(1)}s\n`;
+        if (checksPass === true) {
+          text += `✅ Checks passed in ${checksDuration.toFixed(1)}s\n`;
+        }
       }
 
       if (state.bestMetric !== null) {
@@ -927,6 +1010,10 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       }
 
       text += `\nLast 80 lines of output:\n${details.tailOutput}`;
+
+      if (checksPass === false) {
+        text += `\n\n── Checks output (last 80 lines) ──\n${details.checksOutput}`;
+      }
 
       const truncation = truncateTail(text, {
         maxLines: 150,
@@ -972,6 +1059,28 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         return new Text(text, 0, 0);
       }
 
+      if (d.checksTimedOut) {
+        // Benchmark passed but checks timed out
+        let text =
+          theme.fg("success", `✅ ${d.durationSeconds.toFixed(1)}s`) +
+          theme.fg("error", ` ⏰ checks timeout ${d.checksDuration.toFixed(1)}s`);
+        if (expanded) {
+          text += "\n" + theme.fg("dim", d.checksOutput.slice(-500));
+        }
+        return new Text(text, 0, 0);
+      }
+
+      if (d.checksPass === false) {
+        // Benchmark passed but checks failed
+        let text =
+          theme.fg("success", `✅ ${d.durationSeconds.toFixed(1)}s`) +
+          theme.fg("error", ` 💥 checks failed ${d.checksDuration.toFixed(1)}s`);
+        if (expanded) {
+          text += "\n" + theme.fg("dim", d.checksOutput.slice(-500));
+        }
+        return new Text(text, 0, 0);
+      }
+
       if (d.crashed) {
         let text = theme.fg(
           "error",
@@ -984,6 +1093,10 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       let text =
         theme.fg("success", "✅ ") +
         theme.fg("accent", `${d.durationSeconds.toFixed(1)}s`);
+
+      if (d.checksPass === true) {
+        text += theme.fg("success", ` ✓ checks ${d.checksDuration.toFixed(1)}s`);
+      }
 
       if (expanded) {
         text += "\n" + theme.fg("dim", d.tailOutput.slice(-1000));
@@ -1015,6 +1128,17 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       const secondaryMetrics = params.metrics ?? {};
+
+      // Gate: prevent "keep" when last run's checks failed
+      if (params.status === "keep" && lastRunChecks && !lastRunChecks.pass) {
+        return {
+          content: [{
+            type: "text",
+            text: `❌ Cannot keep — autoresearch.checks.sh failed.\n\n${lastRunChecks.output.slice(-500)}\n\nLog as 'checks_failed' instead. The benchmark metric is valid but correctness checks did not pass.`,
+          }],
+          details: {},
+        };
+      }
 
       // Validate secondary metrics consistency (after first experiment establishes them)
       if (state.secondaryMetrics.length > 0) {
@@ -1162,8 +1286,9 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         // Don't fail if write fails
       }
 
-      // Clear running experiment (log_experiment consumes the run)
+      // Clear running experiment and checks state (log_experiment consumes the run)
       runningExperiment = null;
+      lastRunChecks = null;
 
       updateWidget(ctx);
 
@@ -1181,7 +1306,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       const color =
         args.status === "keep"
           ? "success"
-          : args.status === "crash"
+          : args.status === "crash" || args.status === "checks_failed"
             ? "error"
             : "warning";
       text += theme.fg(color, args.status);
@@ -1200,11 +1325,11 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       const color =
         exp.status === "keep"
           ? "success"
-          : exp.status === "crash"
+          : exp.status === "crash" || exp.status === "checks_failed"
             ? "error"
             : "warning";
       const icon =
-        exp.status === "keep" ? "✓" : exp.status === "crash" ? "✗" : "–";
+        exp.status === "keep" ? "✓" : exp.status === "crash" ? "✗" : exp.status === "checks_failed" ? "⚠" : "–";
 
       let text =
         theme.fg(color, `${icon} `) +
