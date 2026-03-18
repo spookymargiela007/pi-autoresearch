@@ -1184,8 +1184,11 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       if (params.direction === "lower" || params.direction === "higher") {
         state.bestDirection = params.direction;
       }
-      // Reset results for new baseline segment
-      state.results = [];
+      // Start a new segment — keep history for dashboard, but reset baseline tracking.
+      // Old results remain accessible (filtered by segment in rendering).
+      if (isReinit) {
+        state.currentSegment++;
+      }
       state.bestMetric = null;
       state.secondaryMetrics = [];
 
