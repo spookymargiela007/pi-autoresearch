@@ -100,6 +100,7 @@ pnpm typecheck 2>&1 | grep -i error || true
 **LOOP FOREVER.** Never ask "should I continue?" — the user expects autonomous work.
 
 - **Primary metric is king.** Improved → `keep`. Worse/equal → `discard`. Secondary metrics rarely affect this.
+- **Watch the confidence score.** After 3+ runs, `log_experiment` reports a confidence score (best improvement as a multiple of the session noise floor). ≥2.0× means the improvement is likely real. <1.0× means it's within noise — consider re-running to confirm before keeping. The score is advisory — it never auto-discards.
 - **Simpler is better.** Removing code for equal perf = keep. Ugly complexity for tiny gain = probably discard.
 - **Don't thrash.** Repeatedly reverting the same idea? Try something structurally different.
 - **Crashes:** fix if trivial, otherwise log and move on. Don't over-invest.
