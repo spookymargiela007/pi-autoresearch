@@ -126,7 +126,8 @@ Every result is appended to `autoresearch.jsonl` in your project — one line pe
 ### 3. Monitor progress
 
 - **Widget** — always visible above the editor
-- **`/autoresearch`** — full dashboard with results table and best run
+- **`Ctrl+X`** — expand/collapse the full results table inline
+- **`Ctrl+Shift+X`** — fullscreen scrollable dashboard overlay
 - **`Escape`** — interrupt anytime and ask for a summary
 
 ---
