@@ -47,12 +47,14 @@ pi install https://github.com/davebcn87/pi-autoresearch
 | `/autoresearch <text>` | Enter autoresearch mode. If `autoresearch.md` exists, resumes the loop with `<text>` as context. Otherwise, sets up a new session. |
 | `/autoresearch off` | Leave autoresearch mode. Stops auto-resume and clears runtime state but keeps `autoresearch.jsonl` intact. |
 | `/autoresearch clear` | Delete `autoresearch.jsonl`, reset all state, and turn autoresearch mode off. Use this for a clean start. |
+| `/autoresearch export` | Open a live dashboard in your browser. Auto-updates as experiments run. |
 
 **Examples:**
 
 ```
 /autoresearch optimize unit test runtime, monitor correctness
 /autoresearch model training, run 5 minutes of train.py and note the loss ratio as optimization target
+/autoresearch export
 /autoresearch off
 /autoresearch clear
 ```
@@ -139,6 +141,7 @@ The agent reads `autoresearch.jsonl`, groups kept experiments into logical chang
 - **Widget** — always visible above the editor
 - **`Ctrl+X`** — expand/collapse the full results table inline
 - **`Ctrl+Shift+X`** — fullscreen scrollable dashboard overlay
+- **`/autoresearch export`** — open a live browser dashboard with chart and share card
 - **`Escape`** — interrupt anytime and ask for a summary
 
 ---
